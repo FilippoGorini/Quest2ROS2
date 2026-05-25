@@ -1,4 +1,9 @@
-q2r_bringup/__pycache__/.vs/
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# IDE / editor files
 *.vsidx
 *.suo
 *.user
+.vs/

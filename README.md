@@ -23,19 +23,19 @@ https://github.com/user-attachments/assets/f153b410-1828-4f67-8ec8-fc7ae9254131
 
 3. Assume the workspace path is `workspace`, go to `workspace/src`, clone this project with `git clone https://github.com/Taokt/Quest2ROS2.git`
 
-4. **NOTE:** The upstream `ROS–TCP–Endpoint` repository is not fully compatible with our current implementation. To avoid manual patching and reproduction issues, please use our maintained package `ros_tcp_communication` instead.
+4. **NOTE:** the `guguroro/ros_tcp_communication` patch is no longer needed. As of the latest Quest2ROS app update on the Meta Store, the upstream Unity `ROS–TCP–Endpoint` works out of the box with this package: the custom byte parsing the guguroro fork added was for an older wire format and is now counterproductive. Use upstream directly:
 
     Under `workspace/src`, install & build:
 
-    `git clone https://github.com/guguroro/ros_tcp_communication.git`
+    `git clone -b main-ros2 https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git`
 
     `cd ..`
 
-    `colcon build --packages-select ros_tcp_communication`
+    `colcon build --packages-select ros_tcp_endpoint`
 
     `source install/setup.bash`
 
-    In `ros_tcp_communication/launch/endpoint.py`, update the ROS_IP variable in the launch file from the default "0.0.0.0" to match your robot's actual IP address.
+    In `ROS-TCP-Endpoint/launch/endpoint.py`, set the `ROS_IP` parameter to your PC's IP (or leave the default `0.0.0.0` to bind on all interfaces and just enter the right IP on the Quest side).
 
 5.  The `Quest2ROS` application only looking for ros2 message with the specific package name `quest2ros`, therefore one would have to create a seperate package for the the custom messages definitions. 
     Under `/src`, create a new ROS2 package as
