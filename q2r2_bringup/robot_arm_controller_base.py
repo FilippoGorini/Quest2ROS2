@@ -17,7 +17,12 @@ from control_msgs.action import GripperCommand
 from collections import deque
 
 class BaseArmController(Node):
-    def __init__(self, arm_name: str,robot_name:str , mirror: bool, base_frame_id:str , filter_window_size: int , end_effector_link_name: str , ctrl_prefix: str , gripper_action_topic: str):
+    def __init__(self, arm_name: str, robot_name: str, mirror: bool, base_frame_id: str,
+                 filter_window_size: int, end_effector_link_name: str, ctrl_prefix: str,
+                 gripper_action_topic: str,
+                 gripper_open_position: float = 0.0,
+                 gripper_closed_position: float = 0.8,
+                 gripper_max_effort: float = 50.0):
         """
         Base class for controlling a robot arm using Quest3 inputs.
 
@@ -39,6 +44,11 @@ class BaseArmController(Node):
                                (e.g., '/bh_robot/left_arm_clik_controller'). Used to construct the target topic.
             gripper_action_topic (str): The full topic name for the gripper's Action Server 
                                         (e.g., '/bh_robot/left_arm_gripper_action_controller/gripper_cmd').
+            gripper_open_position (float): Target value sent in GripperCommand.position for the
+                                           "open" goal. Defaults to 0.0 (Robotiq open).
+            gripper_closed_position (float): Same, for the "close" goal. Defaults to 0.8 rad
+            gripper_max_effort (float): max_effort sent with each GripperCommand goal. Defaults to
+                                        50.0.
         """
         #Initializing node
         node_name = f"{arm_name}_{robot_name}_arm_controller"
@@ -56,6 +66,11 @@ class BaseArmController(Node):
         # Input param trans
         self.filter_window_size = filter_window_size
         self.end_effector_link_name = end_effector_link_name
+
+        # Gripper command-value defaults (radians for Robotiq 2F-85; meters for linear grippers).
+        self.gripper_open_position = gripper_open_position
+        self.gripper_closed_position = gripper_closed_position
+        self.gripper_max_effort = gripper_max_effort
         
 
         # Initialize parameter and interface
@@ -77,6 +92,14 @@ class BaseArmController(Node):
         self.filter_window_size = self.get_parameter("filter_window_size").value
         self.position_history = deque(maxlen=self.filter_window_size)
         self.orientation_history = deque(maxlen=self.filter_window_size)
+
+        # Gripper goal values
+        self.declare_parameter("gripper_open_position", self.gripper_open_position)
+        self.declare_parameter("gripper_closed_position", self.gripper_closed_position)
+        self.declare_parameter("gripper_max_effort", self.gripper_max_effort)
+        self.gripper_open_position = self.get_parameter("gripper_open_position").value
+        self.gripper_closed_position = self.get_parameter("gripper_closed_position").value
+        self.gripper_max_effort = self.get_parameter("gripper_max_effort").value
 
     def _init_variables(self):
         #Initial basic parameter
@@ -319,12 +342,12 @@ class BaseArmController(Node):
         goal_msg = GripperCommand.Goal()
 
         if self.is_gripper_closed:
-            goal_msg.command.position = 0.0 # 0.0 Fully open
-            goal_msg.command.max_effort = 5.0 
+            goal_msg.command.position = self.gripper_open_position
+            goal_msg.command.max_effort = self.gripper_max_effort
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to open gripper...")
         else:
-            goal_msg.command.position = 0.05 # 0.05 Fully closed
-            goal_msg.command.max_effort = 5.0 
+            goal_msg.command.position = self.gripper_closed_position
+            goal_msg.command.max_effort = self.gripper_max_effort
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to close gripper...")
 
         # Send goal and update state
