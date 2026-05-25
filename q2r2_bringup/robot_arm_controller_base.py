@@ -86,7 +86,7 @@ class BaseArmController(Node):
         self.first_received_quest_position = None # First Quest controller position
         self.first_received_quest_orientation = None # First Quest controller orientation
         self.current_robot_pose = None  # Current EEF position (from TF)
-        self.allow_pose_update = True   # Enable/disable arm motion (toggled in inputs callback)
+        self.allow_pose_update = False  # Gated by the lower button: only True while it's held
         self.is_gripper_closed = False  # Gripper state
         
     def _init_interfaces(self):
@@ -335,8 +335,12 @@ class BaseArmController(Node):
         """
         Callback for Quest 3 controller inputs.
 
-        - Upper button (button_upper): toggle gripper open/close.
-        - Lower button (button_lower): toggle pose streaming on/off and recenter anchors.
+        - Upper button (button_upper): toggle gripper open/close (edge-triggered).
+        - Lower button (button_lower): GATE for pose streaming. Pose targets are
+          published only while the button is held. On press (rising edge) the
+          robot + Quest anchors are reset so motion resumes from the current
+          EEF pose without a jump. On release (falling edge) streaming stops
+          and the robot holds its last commanded position.
         """
         # Ensure edge-detection flags exist (one action per press)
         if not hasattr(self, '_button_upper_pressed_state'):
@@ -348,37 +352,28 @@ class BaseArmController(Node):
         if msg.button_upper and not self._button_upper_pressed_state:
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Upper button pressed. Toggling gripper...")
             self._toggle_gripper()
-            
         # Update upper button press state
         self._button_upper_pressed_state = msg.button_upper
 
-        # Lower button: Toggle pose updates and re-anchor
-        if msg.button_lower and not self._button_lower_pressed_state:
-            # Flip the pose-streaming gate
-            self.allow_pose_update = not self.allow_pose_update
-            
-            state_msg = "ENABLED (publishing poses)" if self.allow_pose_update else "DISABLED (hold position)"
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Lower button pressed: pose streaming is now **{state_msg}**。")
-            
-            robot_pos, robot_ori = self._get_robot_current_pose()
-            
-            if self.last_pose_stamped_always is not None:
-                pass
+        # Lower button: gate for pose streaming
+        rising_edge = msg.button_lower and not self._button_lower_pressed_state
+        falling_edge = (not msg.button_lower) and self._button_lower_pressed_state
 
-            if robot_pos is not None and robot_ori is not None:
-                # Set robot anchor to the current EEF pose
-                self.initial_position = robot_pos
-                self.initial_orientation = robot_ori
-                self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Robot anchor reset to current pose. ")
-                
-                # Force _pose_callback to re-anchor Quest on the next smoothed sample
-                self.initial_orientation = None 
-                self.first_received_quest_position = None
-                self.first_received_quest_orientation = None
-
-            # Clear filter history
+        if rising_edge:
+            # Force _pose_callback to re-anchor both robot and Quest on the next
+            # smoothed sample, so resuming the gate never produces a teleport.
+            self.initial_position = None
+            self.initial_orientation = None
+            self.first_received_quest_position = None
+            self.first_received_quest_orientation = None
             self.position_history.clear()
             self.orientation_history.clear()
 
-        # Update lower button press state
+            self.allow_pose_update = True
+            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Lower button held: pose streaming ENABLED.")
+
+        if falling_edge:
+            self.allow_pose_update = False
+            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Lower button released: pose streaming DISABLED.")
+
         self._button_lower_pressed_state = msg.button_lower
