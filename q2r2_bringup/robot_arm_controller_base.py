@@ -3,7 +3,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TransformStamped, Point
 from quest2ros.msg import OVR2ROSInputs
 from visualization_msgs.msg import Marker
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Float64MultiArray
+from sensor_msgs.msg import JointState
 from tf2_ros import TransformListener, Buffer
 import numpy as np
 import tf_transformations
@@ -11,6 +12,7 @@ import time
 
 # ROS 2 action client and gripper action message
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from control_msgs.action import GripperCommand
 
 # Deque for efficient fixed-length queues
@@ -22,7 +24,10 @@ class BaseArmController(Node):
                  gripper_action_topic: str,
                  gripper_open_position: float = 0.0,
                  gripper_closed_position: float = 0.8,
-                 gripper_max_effort: float = 50.0):
+                 gripper_max_effort: float = 50.0,
+                 gripper_velocity_topic: str = "/gripper_velocity_controller/commands",
+                 gripper_max_speed: float = 1.0,
+                 gripper_mode: str = "velocity"):
         """
         Base class for controlling a robot arm using Quest3 inputs.
 
@@ -62,6 +67,9 @@ class BaseArmController(Node):
         self.base_frame_id = base_frame_id
         self.ctrl_prefix = ctrl_prefix
         self.gripper_action_topic = gripper_action_topic
+        self.gripper_velocity_topic = gripper_velocity_topic
+        self.gripper_max_speed = gripper_max_speed
+        self.gripper_mode = gripper_mode
 
         # Input param trans
         self.filter_window_size = filter_window_size
@@ -100,6 +108,20 @@ class BaseArmController(Node):
         self.gripper_open_position = self.get_parameter("gripper_open_position").value
         self.gripper_closed_position = self.get_parameter("gripper_closed_position").value
         self.gripper_max_effort = self.get_parameter("gripper_max_effort").value
+
+        # Hold-to-move gripper teleop: full-trigger speed as a fraction of max [-1, 1].
+        self.declare_parameter("gripper_max_speed", self.gripper_max_speed)
+        self.gripper_max_speed = self.get_parameter("gripper_max_speed").value
+
+        # Gripper teleop mode: "velocity" (continuous hold-to-move) or "binary"
+        # (discrete open/close goals). Each needs the matching ros2_control gripper
+        # controller active (gripper_velocity_controller / robotiq_gripper_controller).
+        self.declare_parameter("gripper_mode", self.gripper_mode)
+        self.gripper_mode = self.get_parameter("gripper_mode").value
+        if self.gripper_mode not in ("velocity", "binary"):
+            self.get_logger().warn(
+                f"Unknown gripper_mode '{self.gripper_mode}', defaulting to 'velocity'.")
+            self.gripper_mode = "velocity"
 
     def _init_variables(self):
         #Initial basic parameter
@@ -152,6 +174,25 @@ class BaseArmController(Node):
         # Gripper action client
         self.gripper_action_client = ActionClient(self, GripperCommand, self.gripper_action_topic)
         self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Waiting for gripper action server: {self.gripper_action_topic}")
+
+        # Hold-to-move gripper publisher: a length-1 Float64MultiArray carrying a
+        # signed speed in [-1, 1], consumed by gripper_velocity_controller
+        # (forward_command_controller) -> kortex GRIPPER_SPEED.
+        self.gripper_velocity_publisher = self.create_publisher(
+            Float64MultiArray, self.gripper_velocity_topic, 10)
+        self._last_gripper_velocity = 0.0  # so we stop publishing once settled at 0
+
+        # Latched publisher exposing the most recently commanded gripper position (open / closed) so the LeRobot recorder can log it
+        self._last_gripper_command = self.gripper_open_position
+        gripper_cmd_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.gripper_command_state_publisher = self.create_publisher(
+            JointState, "/gripper_command/state", gripper_cmd_qos)
+        self._publish_gripper_command_state(self.gripper_open_position)
 
         self.get_logger().info(f'[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Ready to receive {self.quest_pose_topic} and publish to {self.robot_target_pose_topic}')
 
@@ -330,6 +371,18 @@ class BaseArmController(Node):
         self.last_executed_target_pose = target_pose
         self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Published new target pose.")
     
+    def _publish_gripper_command_state(self, position: float):
+        """Publish the most recently commanded gripper position as a latched
+        JointState on /gripper_command/state so the LeRobot recorder can log the
+        commanded value (0.0 open / gripper_closed_position close) as the gripper
+        dim of the action column, instead of the lagging /joint_states position."""
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = ["robotiq_85_left_knuckle_joint"]
+        msg.position = [float(position)]
+        self.gripper_command_state_publisher.publish(msg)
+        self._last_gripper_command = float(position)
+
     def _toggle_gripper(self):
         """
         Toggle the gripper: send an action goal to open or close it depending on
@@ -352,13 +405,91 @@ class BaseArmController(Node):
 
         # Send goal and update state
         self.gripper_action_client.send_goal_async(goal_msg)
+        self._publish_gripper_command_state(goal_msg.command.position)
         self.is_gripper_closed = not self.is_gripper_closed
+
+    def _send_gripper_goal(self, position: float):
+        """Send a single GripperCommand goal to the GripperActionController
+        (used by binary gripper mode)."""
+        if not self.gripper_action_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().error(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Gripper action server not available.")
+            return
+        goal_msg = GripperCommand.Goal()
+        goal_msg.command.position = position
+        goal_msg.command.max_effort = self.gripper_max_effort
+        self.gripper_action_client.send_goal_async(goal_msg)
+        self._publish_gripper_command_state(position)
+
+    def _command_gripper_binary(self, msg: OVR2ROSInputs):
+        """Binary gripper teleop. Same mapping as velocity mode (index trigger ->
+        CLOSE, middle/grip trigger -> OPEN), but each squeeze sends a single discrete
+        open/close goal to the GripperActionController instead of a continuous speed.
+        Edge-triggered on the analog triggers crossing a threshold, and gated on the
+        pose deadman (button_lower) released so the arm and gripper never move at the
+        same time (the high-level Kortex API can't do both)."""
+        if not hasattr(self, '_index_pressed_state'):
+            self._index_pressed_state = False
+        if not hasattr(self, '_middle_pressed_state'):
+            self._middle_pressed_state = False
+
+        press_threshold = 0.5
+        index_pressed = float(msg.press_index) > press_threshold    # close
+        middle_pressed = float(msg.press_middle) > press_threshold  # open
+
+        # Only act while the arm is held still (deadman released), on the rising
+        # edge so one squeeze issues exactly one goal.
+        if not msg.button_lower:
+            if index_pressed and not self._index_pressed_state:
+                self._send_gripper_goal(self.gripper_closed_position)
+                self.is_gripper_closed = True
+            elif middle_pressed and not self._middle_pressed_state:
+                self._send_gripper_goal(self.gripper_open_position)
+                self.is_gripper_closed = False
+
+        self._index_pressed_state = index_pressed
+        self._middle_pressed_state = middle_pressed
+
+    def _publish_gripper_velocity(self, msg: OVR2ROSInputs):
+        """
+        Hold-to-move gripper control. Maps the two analog triggers to a signed
+        speed in [-1, 1] (index trigger closes, middle/grip trigger opens) and
+        publishes it for gripper_velocity_controller. The gripper is only allowed
+        to move while the pose deadman (button_lower) is released, so the arm and
+        gripper never move at the same time (the high-level Kortex API can't do
+        both anyway). We keep publishing 0 once after stopping so the hardware
+        gets a clean stop, then go quiet until the next squeeze.
+
+        Sign convention: positive = close. The mapping below is intentionally
+        intuitive (index/close -> positive); the Kinova GRIPPER_SPEED sign flip
+        lives in the hardware interface (sendGripperSpeed) so the gripper
+        "velocity" command interface stays a proper derivative of its position.
+        """
+        if msg.button_lower:
+            # Arm is being moved -> gripper must stay put.
+            velocity = 0.0
+        else:
+            close_cmd = float(msg.press_index)    # 0..1, index trigger -> close
+            open_cmd = float(msg.press_middle)    # 0..1, middle trigger -> open
+            velocity = (close_cmd - open_cmd) * self.gripper_max_speed
+            velocity = max(-1.0, min(1.0, velocity))
+
+        # Avoid spamming a steady 0 forever: publish while moving, plus one final 0.
+        if velocity == 0.0 and self._last_gripper_velocity == 0.0:
+            return
+        self.gripper_velocity_publisher.publish(Float64MultiArray(data=[velocity]))
+        self._last_gripper_velocity = velocity
 
     def _inputs_callback(self, msg: OVR2ROSInputs):
         """
         Callback for Quest 3 controller inputs.
 
-        - Upper button (button_upper): toggle gripper open/close (edge-triggered).
+        - Index trigger (press_index): CLOSE the gripper. Middle/grip trigger
+          (press_middle): OPEN it. Behaviour depends on gripper_mode:
+          "velocity" -> analog hold-to-move (squeeze harder = faster, release to
+          stop at intermediate positions); "binary" -> each squeeze sends one
+          discrete open/close goal. Either way the gripper only moves while the arm
+          is held still (pose deadman released), mirroring the Kinova pendant where
+          arm and gripper are mutually exclusive.
         - Lower button (button_lower): GATE for pose streaming. Pose targets are
           published only while the button is held. On press (rising edge) the
           robot + Quest anchors are reset so motion resumes from the current
@@ -366,17 +497,17 @@ class BaseArmController(Node):
           and the robot holds its last commanded position.
         """
         # Ensure edge-detection flags exist (one action per press)
-        if not hasattr(self, '_button_upper_pressed_state'):
-            self._button_upper_pressed_state = False
         if not hasattr(self, '_button_lower_pressed_state'):
             self._button_lower_pressed_state = False
 
-        # Upper button: Toggle gripper
-        if msg.button_upper and not self._button_upper_pressed_state:
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Upper button pressed. Toggling gripper...")
-            self._toggle_gripper()
-        # Update upper button press state
-        self._button_upper_pressed_state = msg.button_upper
+        # Gripper teleop, gated on the arm being still (handled inside each method).
+        # Same mapping in both modes: index -> close, middle -> open.
+        # "velocity" needs gripper_velocity_controller active; "binary" needs
+        # robotiq_gripper_controller active (see the teleop launch file).
+        if self.gripper_mode == "binary":
+            self._command_gripper_binary(msg)
+        else:
+            self._publish_gripper_velocity(msg)
 
         # Lower button: gate for pose streaming
         rising_edge = msg.button_lower and not self._button_lower_pressed_state
