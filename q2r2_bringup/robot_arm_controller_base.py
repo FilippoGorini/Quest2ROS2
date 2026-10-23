@@ -27,7 +27,9 @@ class BaseArmController(Node):
                  gripper_max_effort: float = 50.0,
                  gripper_velocity_topic: str = "/gripper_velocity_controller/commands",
                  gripper_max_speed: float = 1.0,
-                 gripper_mode: str = "velocity"):
+                 gripper_mode: str = "velocity",
+                 gripper_joint: str = "robotiq_85_left_knuckle_joint",
+                 exclusive_gripper_motion: bool = True):
         """
         Base class for controlling a robot arm using Quest3 inputs.
 
@@ -54,6 +56,9 @@ class BaseArmController(Node):
             gripper_closed_position (float): Same, for the "close" goal. Defaults to 0.8 rad
             gripper_max_effort (float): max_effort sent with each GripperCommand goal. Defaults to
                                         50.0.
+            gripper_joint (str): Joint name used for the latched /gripper_command/state message.
+            exclusive_gripper_motion (bool): If True the gripper only moves while the pose deadman
+                                             is released (Kortex high-level API limitation).
         """
         #Initializing node
         node_name = f"{arm_name}_{robot_name}_arm_controller"
@@ -79,7 +84,9 @@ class BaseArmController(Node):
         self.gripper_open_position = gripper_open_position
         self.gripper_closed_position = gripper_closed_position
         self.gripper_max_effort = gripper_max_effort
-        
+        self.gripper_joint = gripper_joint
+        self.exclusive_gripper_motion = exclusive_gripper_motion
+
 
         # Initialize parameter and interface
         self._init_parameters()
@@ -95,6 +102,22 @@ class BaseArmController(Node):
         self.log_time = []
 
     def _init_parameters(self):
+        # Robot setup as params (defaults = constructor args) so a robot profile yaml can set them
+        self.declare_parameter("base_frame", self.base_frame_id)
+        self.declare_parameter("end_effector_link_name", self.end_effector_link_name)
+        self.declare_parameter("ctrl_prefix", self.ctrl_prefix)
+        self.declare_parameter("gripper_action", self.gripper_action_topic)
+        self.declare_parameter("gripper_velocity_topic", self.gripper_velocity_topic)
+        self.declare_parameter("gripper_joint", self.gripper_joint)
+        self.declare_parameter("exclusive_gripper_motion", self.exclusive_gripper_motion)
+        self.base_frame_id = self.get_parameter("base_frame").value
+        self.end_effector_link_name = self.get_parameter("end_effector_link_name").value
+        self.ctrl_prefix = self.get_parameter("ctrl_prefix").value
+        self.gripper_action_topic = self.get_parameter("gripper_action").value
+        self.gripper_velocity_topic = self.get_parameter("gripper_velocity_topic").value
+        self.gripper_joint = self.get_parameter("gripper_joint").value
+        self.exclusive_gripper_motion = self.get_parameter("exclusive_gripper_motion").value
+
         #Moving-average filter configuration
         self.declare_parameter("filter_window_size", self.filter_window_size)
         self.filter_window_size = self.get_parameter("filter_window_size").value
@@ -378,7 +401,7 @@ class BaseArmController(Node):
         dim of the action column, instead of the lagging /joint_states position."""
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = ["robotiq_85_left_knuckle_joint"]
+        msg.name = [self.gripper_joint]
         msg.position = [float(position)]
         self.gripper_command_state_publisher.publish(msg)
         self._last_gripper_command = float(position)
@@ -438,7 +461,7 @@ class BaseArmController(Node):
 
         # Only act while the arm is held still (deadman released), on the rising
         # edge so one squeeze issues exactly one goal.
-        if not msg.button_lower:
+        if not (self.exclusive_gripper_motion and msg.button_lower):
             if index_pressed and not self._index_pressed_state:
                 self._send_gripper_goal(self.gripper_closed_position)
                 self.is_gripper_closed = True
@@ -464,7 +487,7 @@ class BaseArmController(Node):
         lives in the hardware interface (sendGripperSpeed) so the gripper
         "velocity" command interface stays a proper derivative of its position.
         """
-        if msg.button_lower:
+        if self.exclusive_gripper_motion and msg.button_lower:
             # Arm is being moved -> gripper must stay put.
             velocity = 0.0
         else:
